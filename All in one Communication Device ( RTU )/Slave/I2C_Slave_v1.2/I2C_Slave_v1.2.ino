@@ -1,0 +1,297 @@
+#include <Wire.h>
+#include <EEPROM.h>
+
+#define _slaveAddress 0x04
+
+// RS485
+#define _rs485RX 16
+#define _rs485TX 17
+#define _rs485DIR 4
+
+// RS232
+#define _rs232RX 26
+#define _rs232TX 25
+
+// Analog
+#define _analogPin1 32
+#define _analogPin2 33
+
+const byte _relayPins[] = { 12, 18, 19, 23 };
+const byte loadStateEEPROMAddress[] = { 0, 1, 2, 3 };
+bool relayloadsStatus[] = { 0, 0, 0, 0 };
+
+#define I2C_RESPONSE_SIZE 120
+
+char mergeData[I2C_RESPONSE_SIZE];
+
+struct SplitData {
+  String indexOneData;
+  String indexTwoData;
+  String indexThreeData;
+};
+
+unsigned long lastI2CRequest = 0;
+const unsigned long I2C_TIMEOUT1 = 15000;
+
+/* ---------- UART buffers ---------- */
+
+char rs485Buffer[50];
+char rs232Buffer[50];
+
+int rs485Index = 0;
+int rs232Index = 0;
+
+String rs485Data = "";
+String rs232Data = "";
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("ESP32 Boot");
+
+  Wire.begin(_slaveAddress);
+  Wire.onRequest(requestEvent);
+  Wire.onReceive(receiveEvent);
+
+  EEPROM.begin(512);
+
+  pinMode(_rs485DIR, OUTPUT);
+  digitalWrite(_rs485DIR, LOW);
+
+  Serial2.begin(9600, SERIAL_8N1, _rs485RX, _rs485TX);
+  Serial1.begin(9600, SERIAL_8N1, _rs232RX, _rs232TX);
+
+  gpioInit();
+  readDataFromEEPROM();
+
+  lastI2CRequest = millis();
+}
+
+/* ---------- MAIN LOOP ---------- */
+
+void loop() {
+
+  readRS485();
+  readRS232();
+
+  int analog1 = analogRead(_analogPin1);
+  int analog2 = analogRead(_analogPin2);
+
+  if (rs485Data.length() > 0 || rs232Data.length() > 0) {
+
+    snprintf(mergeData, sizeof(mergeData),
+             "%d:%d:%d:%d:%d:%d:%s:%s",
+             analog1,
+             analog2,
+             relayloadsStatus[0],
+             relayloadsStatus[1],
+             relayloadsStatus[2],
+             relayloadsStatus[3],
+             rs485Data.c_str(),
+             rs232Data.c_str());
+  } else {
+
+    snprintf(mergeData, sizeof(mergeData),
+             "%d:%d:%d:%d:%d:%d",
+             analog1,
+             analog2,
+             relayloadsStatus[0],
+             relayloadsStatus[1],
+             relayloadsStatus[2],
+             relayloadsStatus[3]);
+  }
+
+  if (millis() - lastI2CRequest > I2C_TIMEOUT1) {
+
+    Serial.println("⚠ I2C inactive, resetting...");
+    i2cBusRecovery();
+    resetI2C();
+    lastI2CRequest = millis();
+  }
+
+  delay(50);  // Prevent CPU flooding
+}
+
+/* ---------- NON BLOCKING RS485 ---------- */
+
+void readRS485() {
+
+  while (Serial2.available()) {
+
+    char c = Serial2.read();
+
+    if (c == '\n') {
+      rs485Buffer[rs485Index] = '\0';
+      rs485Data = String(rs485Buffer);
+      rs485Data.trim();
+      rs485Index = 0;
+
+    } else {
+      if (rs485Index < sizeof(rs485Buffer) - 1)
+        rs485Buffer[rs485Index++] = c;
+    }
+  }
+}
+
+/* ---------- NON BLOCKING RS232 ---------- */
+
+void readRS232() {
+
+  while (Serial1.available()) {
+
+    char c = Serial1.read();
+
+    if (c == '\n') {
+      rs232Buffer[rs232Index] = '\0';
+      rs232Data = String(rs232Buffer);
+      rs232Data.trim();
+      rs232Index = 0;
+
+    } else {
+      if (rs232Index < sizeof(rs232Buffer) - 1)
+        rs232Buffer[rs232Index++] = c;
+    }
+  }
+}
+
+/* ---------- GPIO ---------- */
+
+void gpioInit() {
+
+  pinMode(_analogPin1, INPUT);
+  pinMode(_analogPin2, INPUT);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(_relayPins[i], OUTPUT);
+    digitalWrite(_relayPins[i], LOW);
+  }
+}
+
+/* ---------- I2C ---------- */
+
+void requestEvent() {
+
+  lastI2CRequest = millis();
+
+  uint8_t buffer[I2C_RESPONSE_SIZE];
+
+  size_t len = strlen(mergeData);
+  if (len > I2C_RESPONSE_SIZE) len = I2C_RESPONSE_SIZE;
+
+  memcpy(buffer, mergeData, len);
+
+  for (size_t i = len; i < I2C_RESPONSE_SIZE; i++) buffer[i] = 0x00;
+
+  Wire.write(buffer, I2C_RESPONSE_SIZE);
+}
+
+void receiveEvent(int numBytes) {
+
+  lastI2CRequest = millis();
+
+  String receivedData = "";
+
+  while (Wire.available()) {
+    char c = Wire.read();
+    receivedData += c;
+  }
+
+  Serial.print("Received from master: ");
+  Serial.println(receivedData);
+
+  SplitData msg = splitStringByColon(receivedData);
+  bool state = msg.indexTwoData.toInt();
+
+  if (msg.indexOneData == "1") controlRelay(0, state);
+  else if (msg.indexOneData == "2") controlRelay(1, state);
+  else if (msg.indexOneData == "3") controlRelay(2, state);
+  else if (msg.indexOneData == "4") controlRelay(3, state);
+  else if (msg.indexOneData == "All") {
+    for (int i = 0; i < 4; i++) controlRelay(i, state);
+  }
+}
+
+/* ---------- RELAY ---------- */
+
+void controlRelay(int index, bool state) {
+  relayControl(_relayPins[index], state);
+  relayloadsStatus[index] = state;
+  writeOneByteInEEPROM(loadStateEEPROMAddress[index], state);
+}
+
+void relayControl(int relayPin, bool state) {
+  digitalWrite(relayPin, state);
+}
+
+/* ---------- EEPROM ---------- */
+
+void readDataFromEEPROM() {
+  for (int i = 0; i < 4; i++) {
+    relayloadsStatus[i] = EEPROM.read(loadStateEEPROMAddress[i]);
+    relayControl(_relayPins[i], relayloadsStatus[i]);
+  }
+}
+
+void writeOneByteInEEPROM(int Add, byte data) {
+  EEPROM.write(Add, data);
+  EEPROM.commit();
+}
+
+/* ---------- I2C RECOVERY ---------- */
+
+void resetI2C() {
+
+  Serial.println("Resetting I2C...");
+
+  Wire.end();
+  delay(10);
+
+  Wire.begin(_slaveAddress);
+  Wire.onRequest(requestEvent);
+  Wire.onReceive(receiveEvent);
+}
+
+void i2cBusRecovery() {
+
+  pinMode(22, OUTPUT);
+  pinMode(21, INPUT);
+
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(22, LOW);
+    delayMicroseconds(5);
+    digitalWrite(22, HIGH);
+    delayMicroseconds(5);
+  }
+
+  pinMode(21, OUTPUT);
+  digitalWrite(21, LOW);
+  delayMicroseconds(5);
+  digitalWrite(21, HIGH);
+}
+
+/* ---------- STRING SPLIT ---------- */
+
+SplitData splitStringByColon(const String& data) {
+
+  SplitData msg;
+
+  int first = data.indexOf(':');
+
+  if (first != -1) {
+
+    msg.indexOneData = data.substring(0, first);
+
+    int second = data.indexOf(':', first + 1);
+
+    if (second != -1) {
+      msg.indexTwoData = data.substring(first + 1, second);
+      msg.indexThreeData = data.substring(second + 1);
+    } else {
+      msg.indexTwoData = data.substring(first + 1);
+    }
+
+  } else {
+    msg.indexOneData = data;
+  }
+
+  return msg;
+}
